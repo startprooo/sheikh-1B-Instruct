@@ -1,0 +1,162 @@
+name: Sheikh-1B CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '**/*.py'
+      - '**/*.ps1'
+      - 'model/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  REPO_ID: 'startprooo/sheikh-1B-instruct'
+
+jobs:
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov black isort
+      
+      - name: Code quality checks
+        run: |
+          black . --check
+          isort . --check
+      
+      - name: Run Python tests
+        run: |
+          pytest test_model.py --cov=. --cov-report=xml
+      
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-coverage
+          path: coverage.xml
+  
+  powershell-tests:
+    name: PowerShell Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup PowerShell environment
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -Force -SkipPublisherCheck
+          Install-Module -Name PSScriptAnalyzer -Force
+      
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path ./ -Recurse
+          $results | Format-Table -AutoSize
+          if ($results.Count -gt 0) {
+            Write-Error "PSScriptAnalyzer found $($results.Count) issues"
+          }
+      
+      - name: Run Pester Tests
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Output.Verbosity = 'Detailed'
+          $config.Run.Path = './tests'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'test-results.xml'
+          Invoke-Pester -Configuration $config
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pester-test-results
+          path: test-results.xml
+  
+  model-quantization:
+    name: Model Quantization
+    needs: [python-tests]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        bits: [8, 4]
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch transformers accelerate bitsandbytes
+          pip install huggingface_hub
+      
+      - name: Run quantization
+        run: python quantize.py --bits ${{ matrix.bits }}
+      
+      - name: Upload quantized model
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          python -c "
+          from huggingface_hub import HfApi
+          api = HfApi(token='${{ env.HF_TOKEN }}')
+          
+          # Upload quantized model
+          api.upload_folder(
+              folder_path=f'./quantized/sheikh-1B-instruct-int${{ matrix.bits }}',
+              repo_id=f'${{ env.REPO_ID }}-int${{ matrix.bits }}',
+              repo_type='model'
+          )
+          "
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-int${{ matrix.bits }}
+          path: quantized/sheikh-1B-instruct-int${{ matrix.bits }}
+  
+  deploy:
+    name: Deploy to Production
+    needs: [python-tests, powershell-tests, model-quantization]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Model Updates
+        shell: pwsh
+        run: |
+          Write-Output "Deploying Sheikh-1B-Instruct updates..."
+          # Add deployment steps here

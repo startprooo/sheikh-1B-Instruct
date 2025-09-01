@@ -1,0 +1,90 @@
+name: 'Model CI/CD Action'
+description: 'Tests, quantizes, and optionally uploads a model to Hugging Face.'
+inputs:
+  python-version:
+    description: 'Python version to use'
+    required: true
+    default: '3.10'
+  hf-token:
+    description: 'Hugging Face API token for authentication'
+    required: true
+  repo-id:
+    description: 'Hugging Face repository ID'
+    required: true
+  precision:
+    description: 'Quantization precision (e.g., 8 or 4)'
+    required: false
+    default: '8'
+  run-test:
+    description: 'Whether to run model loading test'
+    required: false
+    default: 'true'
+  run-quantization:
+    description: 'Whether to run model quantization'
+    required: false
+    default: 'true'
+  run-upload:
+    description: 'Whether to upload quantized model to Hugging Face'
+    required: false
+    default: 'true'
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: 'pip'
+    
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch transformers accelerate bitsandbytes sentencepiece protobuf
+        pip install gradio huggingface_hub pytest pytest-cov black isort
+    
+    - name: Test model loading
+      if: inputs.run-test == 'true'
+      shell: bash
+      run: |
+        python -c "
+        from transformers import LlamaConfig, LlamaForCausalLM, LlamaTokenizer
+        config = LlamaConfig.from_pretrained('./model')
+        tokenizer = LlamaTokenizer.from_pretrained('./model')
+        print('✅ Config and tokenizer loaded successfully')
+        print(f'Vocab size: {tokenizer.vocab_size}')
+        "
+    
+    - name: Run quantization
+      if: inputs.run-quantization == 'true'
+      shell: bash
+      run: |
+        python quantize.py --bits ${{ inputs.precision }}
+    
+    - name: Upload to Hugging Face
+      if: inputs.run-upload == 'true'
+      shell: bash
+      env:
+        HF_TOKEN: ${{ inputs.hf-token }}
+      run: |
+        python -c "
+        from huggingface_hub import HfApi
+        api = HfApi()
+        
+        # Create repo if it doesn't exist
+        try:
+            api.create_repo(
+                repo_id='${{ inputs.repo-id }}-int${{ inputs.precision }}',
+                private=False,
+                exist_ok=True
+            )
+        except Exception as e:
+            print(f'Repository already exists: {e}')
+        
+        # Upload model files
+        api.upload_folder(
+            folder_path='./quantized/sheikh-1B-instruct-int${{ inputs.precision }}',
+            repo_id='${{ inputs.repo-id }}-int${{ inputs.precision }}',
+            repo_type='model'
+        )
+        "
